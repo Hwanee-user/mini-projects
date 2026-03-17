@@ -1,0 +1,388 @@
+from datetime import date
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from models.day_entry import DayEntry
+from scheduler.calculator import minutes_to_str
+
+_WEEKDAY_NAMES = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+class DetailPanel(QWidget):
+    """Right-hand settings / summary / date-detail panel."""
+
+    # Emitted when the user changes a setting or date data
+    target_changed = Signal(int)        # new target in minutes
+    daily_max_changed = Signal(int)     # new daily max in minutes
+    base_actual_changed = Signal(int)   # new lump-sum prior actual in minutes
+    actual_changed = Signal(date, int)  # (date, new actual minutes)
+    included_toggled = Signal(date)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumWidth(370)
+        self._current_entry: DayEntry | None = None
+        self._setup_ui()
+
+    # ── UI construction ───────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Scroll area so it works on small screens
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        layout.addWidget(self._build_settings_group())
+        layout.addWidget(self._build_summary_group())
+        layout.addWidget(self._build_status_area())
+        layout.addWidget(self._build_date_group())
+        layout.addStretch()
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        # Connect settings spinboxes
+        self.target_h_spin.valueChanged.connect(self._emit_target_changed)
+        self.target_m_spin.valueChanged.connect(self._emit_target_changed)
+        self.daily_h_spin.valueChanged.connect(self._emit_daily_max_changed)
+        self.daily_m_spin.valueChanged.connect(self._emit_daily_max_changed)
+        self.base_actual_h_spin.valueChanged.connect(self._emit_base_actual_changed)
+        self.base_actual_m_spin.valueChanged.connect(self._emit_base_actual_changed)
+
+        self._set_date_controls_enabled(False)
+
+    def _build_settings_group(self) -> QGroupBox:
+        group = QGroupBox("설정")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        # Monthly target
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("월 목표:"))
+        self.target_h_spin = QSpinBox()
+        self.target_h_spin.setRange(0, 300)
+        self.target_h_spin.setValue(57)
+        self.target_h_spin.setSuffix(" 시간")
+        self.target_m_spin = QSpinBox()
+        self.target_m_spin.setRange(0, 59)
+        self.target_m_spin.setValue(0)
+        self.target_m_spin.setSuffix(" 분")
+        target_row.addWidget(self.target_h_spin)
+        target_row.addWidget(self.target_m_spin)
+        target_row.addStretch()
+        layout.addLayout(target_row)
+
+        # Daily max
+        daily_row = QHBoxLayout()
+        daily_row.addWidget(QLabel("1일 최대:"))
+        self.daily_h_spin = QSpinBox()
+        self.daily_h_spin.setRange(0, 12)
+        self.daily_h_spin.setValue(4)
+        self.daily_h_spin.setSuffix(" 시간")
+        self.daily_m_spin = QSpinBox()
+        self.daily_m_spin.setRange(0, 59)
+        self.daily_m_spin.setValue(0)
+        self.daily_m_spin.setSuffix(" 분")
+        daily_row.addWidget(self.daily_h_spin)
+        daily_row.addWidget(self.daily_m_spin)
+        daily_row.addStretch()
+        layout.addLayout(daily_row)
+
+        # Lump-sum prior actual (월 중 앱 시작 전 이미 기록된 초과근무 합계)
+        from PySide6.QtWidgets import QFrame as _QFrame
+        sep = _QFrame()
+        sep.setFrameShape(_QFrame.HLine)
+        sep.setStyleSheet("color: #BDBDBD;")
+        layout.addWidget(sep)
+
+        base_lbl = QLabel("이전 실적 누계:")
+        base_lbl.setToolTip(
+            "달력에 날짜별로 입력하기 전에 이미 진행된 초과근무 시간을\n"
+            "여기에 일괄 입력하세요. 달력에는 반영되지 않지만\n"
+            "월간 합계 계산에는 포함됩니다."
+        )
+        layout.addWidget(base_lbl)
+
+        base_row = QHBoxLayout()
+        self.base_actual_h_spin = QSpinBox()
+        self.base_actual_h_spin.setRange(0, 300)
+        self.base_actual_h_spin.setValue(0)
+        self.base_actual_h_spin.setSuffix(" 시간")
+        self.base_actual_m_spin = QSpinBox()
+        self.base_actual_m_spin.setRange(0, 59)
+        self.base_actual_m_spin.setValue(0)
+        self.base_actual_m_spin.setSuffix(" 분")
+        base_row.addWidget(self.base_actual_h_spin)
+        base_row.addWidget(self.base_actual_m_spin)
+        base_row.addStretch()
+        layout.addLayout(base_row)
+
+        return group
+
+    def _build_summary_group(self) -> QGroupBox:
+        group = QGroupBox("월간 요약")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(5)
+
+        self.original_target_lbl = self._stat_value_label()  # hidden — kept for calc reference
+        self.actual_total_lbl = self._stat_value_label()
+        self.planned_total_lbl = self._stat_value_label()
+        self.remaining_lbl = self._stat_value_label()
+        self.max_possible_lbl = self._stat_value_label()      # hidden
+        self.effective_target_lbl = self._stat_value_label()  # hidden
+
+        # Only these 3 rows are visible
+        visible_rows = [
+            ("이번달 목표 초과근무:", self.original_target_lbl),
+            ("실제 초과근무 시간:", self.actual_total_lbl),
+            ("예정 초과근무 시간:", self.planned_total_lbl),
+            ("남은 목표:", self.remaining_lbl),
+        ]
+        for key_text, val_lbl in visible_rows:
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            key_lbl = QLabel(key_text)
+            key_lbl.setMinimumWidth(140)
+            row_l.addWidget(key_lbl)
+            row_l.addWidget(val_lbl)
+            row_l.addStretch()
+            layout.addWidget(row_w)
+
+        return group
+
+    def _build_status_area(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            "padding: 7px; background: #E8F5E9; border-radius: 4px; font-size: 13px;"
+        )
+        self.status_label.setVisible(False)
+
+        self.warning_label = QLabel()
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet(
+            "padding: 7px; background: #FFF3E0; border-radius: 4px; "
+            "font-size: 12px; color: #E65100;"
+        )
+        self.warning_label.setVisible(False)
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.warning_label)
+        return container
+
+    def _build_date_group(self) -> QGroupBox:
+        self.date_group = QGroupBox("선택한 날짜")
+        layout = QVBoxLayout(self.date_group)
+        layout.setSpacing(8)
+
+        self.date_info_label = QLabel("날짜를 선택하세요.")
+        self.date_info_label.setWordWrap(True)
+        self.date_info_label.setAlignment(Qt.AlignTop)
+        self.date_info_label.setMinimumHeight(60)
+        layout.addWidget(self.date_info_label)
+
+        # Include / Exclude toggle button
+        self.toggle_btn = QPushButton("포함/제외 토글")
+        self.toggle_btn.setMinimumHeight(32)
+        self.toggle_btn.clicked.connect(self._on_toggle_clicked)
+        layout.addWidget(self.toggle_btn)
+
+        # Actual time spinboxes
+        actual_row = QHBoxLayout()
+        actual_row.addWidget(QLabel("실제 초과근무:"))
+        self.actual_h_spin = QSpinBox()
+        self.actual_h_spin.setRange(0, 24)
+        self.actual_h_spin.setSuffix(" 시간")
+        self.actual_m_spin = QSpinBox()
+        self.actual_m_spin.setRange(0, 59)
+        self.actual_m_spin.setSuffix(" 분")
+        actual_row.addWidget(self.actual_h_spin)
+        actual_row.addWidget(self.actual_m_spin)
+        actual_row.addStretch()
+        layout.addLayout(actual_row)
+
+        self.apply_btn = QPushButton("실제 시간 적용")
+        self.apply_btn.setMinimumHeight(32)
+        self.apply_btn.clicked.connect(self._on_apply_actual)
+        layout.addWidget(self.apply_btn)
+
+        return self.date_group
+
+    # ── Helper factories ──────────────────────────────────────────────
+
+    @staticmethod
+    def _stat_value_label() -> QLabel:
+        lbl = QLabel("—")
+        lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
+        return lbl
+
+    def _set_date_controls_enabled(self, enabled: bool) -> None:
+        self.toggle_btn.setEnabled(enabled)
+        self.actual_h_spin.setEnabled(enabled)
+        self.actual_m_spin.setEnabled(enabled)
+        self.apply_btn.setEnabled(enabled)
+
+    # ── Public update entry point ─────────────────────────────────────
+
+    def update_state(
+        self,
+        year: int,
+        month: int,
+        target_minutes: int,
+        daily_max_minutes: int,
+        summary: dict,
+        selected_entry: DayEntry | None,
+    ) -> None:
+        # Settings spinboxes — update without triggering recalculation
+        self._block_setting_signals(True)
+        self.target_h_spin.setValue(target_minutes // 60)
+        self.target_m_spin.setValue(target_minutes % 60)
+        self.daily_h_spin.setValue(daily_max_minutes // 60)
+        self.daily_m_spin.setValue(daily_max_minutes % 60)
+        self._block_setting_signals(False)
+
+        # Summary labels
+        self.original_target_lbl.setText(minutes_to_str(summary.get("original_target", 0)))
+        self.actual_total_lbl.setText(minutes_to_str(summary.get("actual_total", 0)))
+        self.planned_total_lbl.setText(minutes_to_str(summary.get("planned_total", 0)))
+        self.max_possible_lbl.setText(minutes_to_str(summary.get("max_possible_total", 0)))
+        self.effective_target_lbl.setText(minutes_to_str(summary.get("effective_target", 0)))
+
+        remaining = summary.get("remaining", 0)
+        if remaining > 0:
+            self.remaining_lbl.setText(minutes_to_str(remaining))
+            self.remaining_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #E65100;")
+        else:
+            self.remaining_lbl.setText(minutes_to_str(0))
+            self.remaining_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #2E7D32;")
+
+        # Status / warning
+        status = summary.get("status", "")
+        warning = summary.get("warning", "")
+
+        self.status_label.setVisible(bool(status))
+        self.status_label.setText(status)
+        self.warning_label.setVisible(bool(warning))
+        self.warning_label.setText(warning)
+
+        # Date detail section
+        self._current_entry = selected_entry
+        self._refresh_date_section(selected_entry)
+
+    # ── Date detail section ───────────────────────────────────────────
+
+    def _refresh_date_section(self, entry: DayEntry | None) -> None:
+        if entry is None:
+            self.date_group.setTitle("선택한 날짜")
+            self.date_info_label.setText("달력에서 날짜를 클릭하세요.")
+            self.toggle_btn.setText("포함/제외 토글")
+            self.toggle_btn.setStyleSheet("")
+            self._set_date_controls_enabled(False)
+            return
+
+        d = entry.date
+        today = date.today()
+        wday_str = _WEEKDAY_NAMES[d.weekday()]
+
+        self.date_group.setTitle(f"선택한 날짜: {d.year}/{d.month:02d}/{d.day:02d} ({wday_str})")
+
+        # Build info text
+        tags: list[str] = []
+        if entry.is_holiday:
+            tags.append(f"공휴일 ({entry.holiday_name})")
+        if entry.is_weekend:
+            tags.append("주말")
+        if d < today:
+            tags.append("과거")
+        elif d == today:
+            tags.append("오늘")
+
+        included_str = "포함 (자동 배정 대상)" if entry.included else "제외 (자동 배정 제외)"
+        planned_str = minutes_to_str(entry.planned_minutes) if entry.planned_minutes > 0 else "없음"
+        actual_str = minutes_to_str(entry.actual_minutes) if entry.actual_minutes > 0 else "없음"
+
+        info_parts = [
+            f"구분: {', '.join(tags) if tags else '평일'}",
+            f"상태: {included_str}",
+            f"예정 초과근무: {planned_str}",
+            f"실제 초과근무: {actual_str}",
+        ]
+        self.date_info_label.setText("\n".join(info_parts))
+
+        # Toggle button appearance
+        if entry.included:
+            self.toggle_btn.setText("⛔  이 날짜 자동 배정 제외")
+            self.toggle_btn.setStyleSheet(
+                "QPushButton { background-color: #FFCDD2; } "
+                "QPushButton:hover { background-color: #EF9A9A; }"
+            )
+        else:
+            self.toggle_btn.setText("✅  이 날짜 자동 배정 포함")
+            self.toggle_btn.setStyleSheet(
+                "QPushButton { background-color: #C8E6C9; } "
+                "QPushButton:hover { background-color: #A5D6A7; }"
+            )
+
+        # Actual time spinboxes — update silently
+        self._block_actual_signals(True)
+        self.actual_h_spin.setValue(entry.actual_minutes // 60)
+        self.actual_m_spin.setValue(entry.actual_minutes % 60)
+        self._block_actual_signals(False)
+
+        self._set_date_controls_enabled(True)
+
+    # ── Signal handlers ───────────────────────────────────────────────
+
+    def _on_toggle_clicked(self) -> None:
+        if self._current_entry is not None:
+            self.included_toggled.emit(self._current_entry.date)
+
+    def _on_apply_actual(self) -> None:
+        if self._current_entry is not None:
+            total = self.actual_h_spin.value() * 60 + self.actual_m_spin.value()
+            self.actual_changed.emit(self._current_entry.date, total)
+
+    def _emit_target_changed(self) -> None:
+        total = self.target_h_spin.value() * 60 + self.target_m_spin.value()
+        self.target_changed.emit(total)
+
+    def _emit_daily_max_changed(self) -> None:
+        total = self.daily_h_spin.value() * 60 + self.daily_m_spin.value()
+        self.daily_max_changed.emit(total)
+
+    # ── Signal blocking helpers ───────────────────────────────────────
+
+    def _block_setting_signals(self, block: bool) -> None:
+        for spin in (self.target_h_spin, self.target_m_spin,
+                     self.daily_h_spin, self.daily_m_spin):
+            spin.blockSignals(block)
+
+    def _block_actual_signals(self, block: bool) -> None:
+        for spin in (self.actual_h_spin, self.actual_m_spin):
+            spin.blockSignals(block)
